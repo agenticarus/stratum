@@ -743,12 +743,17 @@ def test_folded_notna_reports_nan_on_derived_operand(use_polars):
 @pytest.mark.parametrize("use_polars", [False, True], ids=["pandas", "polars"])
 def test_folded_fillna_fills_nan_after_a_chained_method(use_polars):
     # A chained method call is exactly the shape the fast dtype resolver
-    # cannot name; the schema probe has to answer for it (#216).
+    # cannot name; the schema probe has to answer for it (#216). The polars
+    # input is built directly: from_pandas defaults nan_to_null=True, which
+    # would replace the NaN with a null and let the fill_null half answer
+    # for both (the test passed on main for exactly that reason -- #221
+    # review).
     frame = pd.DataFrame({"x": [0.0, np.nan, 3.0]})
     inner = ColumnMethodExpr(Col("x"), "clip", (1.0, 1.5))
     expr = ColumnMethodExpr(inner, "fillna", (0.0,))
     op = AssignMapOp(entries={"r": expr})
-    input_frame = pl.from_pandas(frame) if use_polars else frame
+    input_frame = pl.DataFrame({"x": [0.0, np.nan, 3.0]}) if use_polars \
+        else frame
     with force_polars(use_polars):
         result = run_op(op, input_frame)
     np.testing.assert_allclose(
@@ -767,6 +772,60 @@ def test_where_series_branch_promotes_fill_value(use_polars):
     with force_polars(use_polars):
         result = run_op(op, column, condition)
     assert [1.0, 1.5, 3.0] == list(result)
+
+
+@pytest.mark.parametrize("use_polars", [False, True], ids=["pandas", "polars"])
+def test_where_keeps_narrow_float_dtype(use_polars):
+    # pandas keeps float32 for a scalar fill the column can hold; pl.repeat
+    # inferred the scalar's own dtype and widened Float32 to Float64 (#221
+    # review). when/then/otherwise supertypes without the pin and keeps it.
+    op = ColumnMethodOp(method="where", args=(OperandRef(1), 1.5))
+    column = pl.Series([1.0, 2.0, 3.0], dtype=pl.Float32) if use_polars \
+        else pd.Series([1.0, 2.0, 3.0], dtype="float32")
+    condition = pl.Series([True, False, True]) if use_polars \
+        else pd.Series([True, False, True])
+    with force_polars(use_polars):
+        result = run_op(op, column, condition)
+    assert [1.0, 1.5, 3.0] == list(result)
+    if use_polars:
+        assert pl.Float32 == result.dtype
+    else:
+        assert np.dtype("float32") == result.dtype
+
+
+@pytest.mark.parametrize("use_polars", [False, True], ids=["pandas", "polars"])
+def test_where_fills_null_not_coerced_nan_on_string_column(use_polars):
+    # NaN is unrepresentable in a string column: pandas keeps the dtype and
+    # fills missing (an object column holding NaN); polars' supertype cast
+    # materialized the string "NaN", so a downstream notna() reported the
+    # row as present (#221 review).
+    op = ColumnMethodOp(method="where", args=(OperandRef(1), np.nan))
+    column = pl.Series(["a", "b", "c"]) if use_polars \
+        else pd.Series(["a", "b", "c"])
+    condition = pl.Series([True, False, True]) if use_polars \
+        else pd.Series([True, False, True])
+    with force_polars(use_polars):
+        result = run_op(op, column, condition)
+    values = list(result)
+    assert values[0] == "a" and values[2] == "c"
+    assert (values[1] is None or values[1] != values[1])  # null or NaN
+
+
+@pytest.mark.parametrize("use_polars", [False, True], ids=["pandas", "polars"])
+def test_folded_fillna_with_non_numeric_value_fills_nan(use_polars):
+    # fill_null can coerce the result's dtype (a string fill makes it
+    # String); the NaN half ran after that cast and fill_nan raised
+    # InvalidOperationError on the operand it had gated as float (#221
+    # review).
+    frame = pd.DataFrame({"a": [1.0, 0.0, 3.0], "b": [2.0, 0.0, 4.0]})
+    expr = ColumnMethodExpr(BinOpExpr(operator.truediv, Col("a"), Col("b")),
+                            "fillna", ("unknown",))
+    op = AssignMapOp(entries={"r": expr})
+    input_frame = pl.from_pandas(frame) if use_polars else frame
+    with force_polars(use_polars):
+        result = run_op(op, input_frame)
+    values = [str(v) for v in result["r"]]
+    assert values == ["0.5", "unknown", "0.75"]
 
 
 if __name__ == "__main__":

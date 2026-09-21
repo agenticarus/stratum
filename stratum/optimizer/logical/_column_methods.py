@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+import math
+
 from stratum.optimizer.logical._base import (
     OutputType, _resolve_args, _resolve_kwargs)
 from stratum.optimizer.logical import _schema
@@ -154,16 +156,26 @@ def _polars_astype(obj, args, kwargs, dtype=None):
     return obj.cast(polars_dtype(target), strict=True)
 
 
-def _polars_fillna(obj, args, kwargs, dtype=None):
-    # pandas fills NaN as well as null, polars needs both calls. The fill_nan
+def _fillna_fills_nan_on(actual_dtype):
+    # pandas fills NaN as well as null; polars needs both calls. The fill_nan
     # half runs whenever the operand's dtype resolves as float -- including
     # derived operands, via the schema-only probe in _column_expr (#216).
+    return actual_dtype is not None and actual_dtype.is_float()
+
+
+def _polars_fillna(obj, args, kwargs, dtype=None):
     value = _arg(args, kwargs, 0, "value")
-    result = obj.fill_null(value)
     actual_dtype = getattr(obj, "dtype", None) or dtype
-    if actual_dtype is not None and actual_dtype.is_float():
-        result = result.fill_nan(value)
-    return result
+    if not _fillna_fills_nan_on(actual_dtype):
+        return obj.fill_null(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # The NaN half runs on the pre-fill operand: fill_null may coerce the
+        # result's dtype (a string fill makes it String), and fill_nan is
+        # float-gated -- applying it after the null fill raises (#221 review).
+        return obj.fill_nan(value).fill_null(value)
+    # A non-numeric fill on a float column: pandas fills NaN and null alike.
+    # NaN is not castable to the fill value, so route it through null first.
+    return obj.fill_nan(None).fill_null(value)
 
 
 def _polars_clip(obj, args, kwargs, dtype=None):
@@ -175,16 +187,23 @@ def _polars_clip(obj, args, kwargs, dtype=None):
 def _polars_where(obj, args, kwargs, dtype=None):
     condition = args[0]
     other = _arg(args, kwargs, 1, "other", np.nan)
+    if isinstance(other, float) and math.isnan(other):
+        # pandas fills with NaN without changing the dtype (object columns keep
+        # NaN as missing). Polars casts NaN to the column dtype on supertyping,
+        # which would materialize the string "NaN" or the integer-masked row;
+        # NaN is only representable in float (promotion, like an int column
+        # with a NaN fill in pandas) -- every other dtype gets a null fill.
+        target = getattr(obj, "dtype", None) or dtype
+        if target is not None and not (
+            target.is_float() or target.is_integer()):
+            other = None
+    result = pl.when(condition).then(obj).otherwise(pl.lit(other))
     if isinstance(obj, pl.Series):
-        if not isinstance(other, pl.Series):
-            # pandas promotes the result to the supertype of column and fill
-            # value, so the fill value must not be pinned to the column dtype
-            # (#216): an int column's .where(cond, 1.5) is float in pandas and
-            # raises here otherwise. repeat() infers the scalar's own dtype
-            # and zip_with supertypes the pair, matching pandas.
-            other = pl.repeat(other, len(obj), eager=True)
-        return obj.zip_with(condition, other)
-    return pl.when(condition).then(obj).otherwise(other)
+        # Series-branch operands have no frame to select against; the eager
+        # eval of the same expression keeps both branches on one code path
+        # (#221 review: the zip_with pin drifted from when/then/otherwise).
+        return pl.select(result).to_series()
+    return result
 
 
 def _polars_isin(obj, args, kwargs, dtype=None):
